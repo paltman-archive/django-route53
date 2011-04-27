@@ -18,98 +18,106 @@ def route53():
     )
 
 
+def commit_record(hosted_zone_id, name, kind, value, change="CREATE", ttl=600, comment=""):
+    changes = ResourceRecordSets(route53(), hosted_zone_id, comment)
+    change = changes.add_change(change, name, kind, ttl)
+    change.add_value(value)
+    return changes.commit()
+
+
 class HostedZone(models.Model):
     
-    name = models.CharField(max_length=512, unique=True)
+    name = models.CharField(max_length=512)
     
-    zone_id = models.CharField(max_length=128, editable=False)
+    zone_id = models.CharField(max_length=128, editable=False, unique=True)
     
-    created_by = models.ForeignKey(User, editable=False)
+    created_by = models.ForeignKey(User)
     created_on = models.DateTimeField(default=datetime.datetime.now, editable=False)
     deleted_on = models.DateTimeField(null=True, blank=True, editable=False)
     
-    class Meta:
-        unique_together = ["name", "deleted_on"]
+    def active(self):
+        return self.deleted_on is None
+    active.boolean = True
     
     def __unicode__(self):
-        return unicode(self.name)
+        return u"[%s] %s" % (self.zone_id, self.name)
+    
+    class Meta:
+        ordering = ["name", "zone_id"]
     
     def delete(self):
         route53().delete_hosted_zone(self.zone_id)
         self.deleted_on = datetime.datetime.now()
         super(HostedZone, self).save()
     
+    # @@@ pull this out into a management command
     @staticmethod
     def sync_all(who):
         zones = route53().get_all_hosted_zones()["ListHostedZonesResponse"]["HostedZones"]
         for zone in zones:
             try:
-                hz = HostedZone.objects.get(name=zone["Name"], deleted_on__isnull=True)
+                hz = HostedZone.objects.get(zone_id=zone["Id"].replace("/hostedzone/", ""))
             except HostedZone.DoesNotExist:
-                hz = HostedZone.objects.create(
-                    name=zone["Name"],
-                    zone_id=zone["Id"].replace("/hostedzone/", ""),
-                    created_by=who
+                hz = HostedZone(
+                    name = zone["Name"],
+                    zone_id = zone["Id"].replace("/hostedzone/", ""),
+                    created_by = who
                 )
+                hz.save(skip_api_call=True)
             hz.sync()
     
     def sync(self):
         self.name = route53().get_hosted_zone(self.zone_id)["GetHostedZoneResponse"]["HostedZone"]["Name"]
         super(HostedZone, self).save()
         
-        self.records.all().delete()
+        for r in self.records.all():
+            r.delete(skip_api_call=True)
         rrsets = route53().get_all_rrsets(self.zone_id)
         
         for record_set in rrsets:
-            record_obj = self.records.create(
-                name = record_set.name,
-                kind = getattr(Record, record_set.type),
-                ttl = record_set.ttl
-            )
             for record in record_set.resource_records:
-                record_obj.values.create(value=record)
+                r = Record(
+                    zone = self,
+                    name = record_set.name,
+                    kind = getattr(Record, record_set.type),
+                    ttl = record_set.ttl,
+                    value = record,
+                    created_by = self.created_by
+                )
+                r.save(skip_api_call=True)
     
     def save(self, *args, **kwargs):
-        if self.pk is None:
-            r = route53().create_hosted_zone(self.name)["CreateHostedZoneResponse"]
-            self.zone_id = r["HostedZone"]["Id"].replace("/hostedzone/", "")
+        skip_api_call = kwargs.pop("skip_api_call", False)
+        if skip_api_call:
             super(HostedZone, self).save(*args, **kwargs)
-            
-            record = self.records.create(
-                kind=Record.NS,
-                name=self.name
-            )
-            
-            for ns in r["DelegationSet"]["NameServers"]:
-                record.values.create(
-                    value=ns
-                )
-            
-            self.changes.create(
-                change_id=r["ChangeInfo"]["Id"].replace("/change/", ""),
+        else:
+            if self.pk is None:
+                r = route53().create_hosted_zone(self.name)["CreateHostedZoneResponse"]
+                self.zone_id = r["HostedZone"]["Id"].replace("/hostedzone/", "")
+                super(HostedZone, self).save(*args, **kwargs)
                 
-            )
-        # @@@ raise exception or just noop? hosted zones can only be created/deleted
+                for ns in r["DelegationSet"]["NameServers"]:
+                    record = Record(
+                        zone = self,
+                        kind = Record.NS,
+                        name = self.name,
+                        value = ns,
+                        created_by = self.created_by
+                    )
+                    record.save(skip_api_call=True)
+                
+                self.changes.create(
+                    change_id=r["ChangeInfo"]["Id"].replace("/change/", ""),
+                    
+                )
+            # @@@ raise exception or just noop? hosted zones can only be created/deleted
     
     @property
     def nameservers(self):
-        ns = []
-        for record in self.records.filter(kind=Record.NS):
-            for value in record.values.all():
-                ns.append(value.value)
-        return ns
+        return [r.value for r in self.records.filter(kind=Record.NS)]
 
 
 class Record(models.Model):
-    """
-    import boto
-    conn = boto.connect_route53()
-    from boto.route53.record import ResourceRecordSets
-    changes = ResourceRecordSets(conn, hosted_zone_id, comment)
-    change = changes.add_change("CREATE", name, type, ttl)
-    change.add_value(value)
-    something = changes.commit()
-    """
     
     A = 1
     AAAA = 2
@@ -139,30 +147,62 @@ class Record(models.Model):
     zone = models.ForeignKey(HostedZone, related_name="records")
     kind = models.IntegerField(choices=RECORD_KINDS)
     ttl = models.IntegerField(default=60)
+    value = models.CharField(max_length=4000)
     
-    def make_record(self): # @@@ should this be in a post_save signal handler for handling the save of a Record with RecorvValue inlines?
-        changes = ResourceRecordSets(route53(), self.zone.zone_id, "Managed by gondor.io")
-        for value in self.values.all():
-            change = changes.add_change("CREATE", self.name, self.get_kind_display(), self.ttl)
-            change.add_value(value.value)
-        self.changes.create(
-            change_id=changes.commit()["ChangeResourceRecordSetsResponse"]["ChangeInfo"]["Id"].replace("/change/", "")
-        )
+    created_by = models.ForeignKey(User)
+    created_on = models.DateTimeField(default=datetime.datetime.now, editable=False)
+    deleted_on = models.DateTimeField(null=True, blank=True, editable=False)
+    
+    def active(self):
+        return self.deleted_on is None
+    active.boolean = True
     
     def __unicode__(self):
         return u"%s %s" % (
             self.zone,
             self.get_kind_display()
         )
-
-
-class RecordValue(models.Model):
     
-    record = models.ForeignKey(Record, related_name="values")
-    value = models.CharField(max_length=4000)
+    def delete(self, skip_api_call=False):
+        if not skip_api_call:
+            response = commit_record(
+                self.zone.zone_id,
+                self.name,
+                self.get_kind_display(),
+                self.value,
+                change="DELETE",
+                ttl=self.ttl,
+                comment="Managed by django-route53"
+            )
+            
+            self.changes.create(
+                change_id=response["ChangeResourceRecordSetsResponse"]["ChangeInfo"]["Id"].replace("/change/", "")
+            )
+        
+        self.deleted_on = datetime.datetime.now()
+        super(Record, self).save()
     
-    def __unicode__(self):
-        return unicode(self.value)
+    def save(self, *args, **kwargs):
+        skip_api_call = kwargs.pop("skip_api_call", False)
+        
+        if skip_api_call:
+            super(Record, self).save(*args, **kwargs)
+        else:
+            if self.pk is None:
+                response = commit_record(
+                    self.zone.zone_id,
+                    self.name,
+                    self.get_kind_display(),
+                    self.value,
+                    change="CREATE",
+                    ttl=self.ttl,
+                    comment="Managed by django-route53"
+                )
+                super(Record, self).save(*args, **kwargs)
+                self.changes.create(
+                    change_id=response["ChangeResourceRecordSetsResponse"]["ChangeInfo"]["Id"].replace("/change/", "")
+                )
+        # @@@ raise exception or just noop? hosted zones can only be created/deleted
 
 
 class Change(models.Model):
